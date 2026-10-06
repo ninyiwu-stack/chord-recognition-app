@@ -16,41 +16,107 @@ import re
 
 # ========== 和弦辨識核心邏輯 ==========
 
+# ========== 和弦辨識核心邏輯 ==========
+
 PITCHES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
-CHORD_INTERVALS = {
-    "":     [0, 4, 7],
-    "m":    [0, 3, 7],
-    "7":    [0, 4, 7, 10],
-    "maj7": [0, 4, 7, 11],
-    "m7":   [0, 3, 7, 10],
-    "sus2": [0, 2, 7],
-    "sus4": [0, 5, 7],
-    "add9": [0, 4, 7, 2],
-    "dim":  [0, 3, 6],
-    "aug":  [0, 4, 8],
+# 加上 penalty（複雜度懲罰），數字越大代表越容易被懲罰、越不容易被誤選
+CHORD_TYPES = {
+    "":     {"intervals": [0, 4, 7],      "penalty": 0.00},
+    "m":    {"intervals": [0, 3, 7],      "penalty": 0.00},
+    "7":    {"intervals": [0, 4, 7, 10],  "penalty": 0.03},
+    "m7":   {"intervals": [0, 3, 7, 10],  "penalty": 0.03},
+    "maj7": {"intervals": [0, 4, 7, 11],  "penalty": 0.05},
+    "sus2": {"intervals": [0, 2, 7],      "penalty": 0.05},
+    "sus4": {"intervals": [0, 5, 7],      "penalty": 0.05},
+    "add9": {"intervals": [0, 4, 7, 2],   "penalty": 0.06},
+    "dim":  {"intervals": [0, 3, 6],      "penalty": 0.06},
+    "aug":  {"intervals": [0, 4, 8],      "penalty": 0.06},
 }
 
 def build_templates():
     templates = {}
     for root_i in range(12):
         root_name = PITCHES[root_i]
-        for suffix, intervals in CHORD_INTERVALS.items():
+        for suffix, cfg in CHORD_TYPES.items():
             vec = np.zeros(12)
-            for itv in intervals:
+            for itv in cfg["intervals"]:
                 vec[(root_i + itv) % 12] = 1.0
             vec = vec / np.linalg.norm(vec)
-            templates[f"{root_name}{suffix}"] = vec
+            templates[f"{root_name}{suffix}"] = {
+                "vector": vec,
+                "penalty": cfg["penalty"],
+            }
     return templates
 
 TEMPLATES = build_templates()
 TEMPLATE_LABELS = list(TEMPLATES.keys())
-TEMPLATE_MATRIX = np.stack([TEMPLATES[l] for l in TEMPLATE_LABELS], axis=0)
+TEMPLATE_MATRIX = np.stack([TEMPLATES[l]["vector"] for l in TEMPLATE_LABELS], axis=0)
+TEMPLATE_PENALTIES = np.array([TEMPLATES[l]["penalty"] for l in TEMPLATE_LABELS])
 
-def recognize_chords(audio_path, hop_length=2048, smooth_size=9, min_seg_sec=0.5):
+# ---------- 調性偵測（新增） ----------
+
+MAJOR_SCALE_DEGREES = [0, 2, 4, 5, 7, 9, 11]
+DEGREE_CHORD_TYPES = ["", "m", "m", "", "", "m", "dim"]
+
+def get_diatonic_chords(key_root_i):
+    diatonic = []
+    for deg, ctype in zip(MAJOR_SCALE_DEGREES, DEGREE_CHORD_TYPES):
+        root_i = (key_root_i + deg) % 12
+        diatonic.append(PITCHES[root_i] + ctype)
+    return diatonic
+
+def detect_key(chroma):
+    avg_chroma = np.mean(chroma, axis=1)
+    avg_chroma = avg_chroma / (np.linalg.norm(avg_chroma) + 1e-9)
+    best_key, best_score = 0, -1
+    for key_i in range(12):
+        mask = np.zeros(12)
+        for deg in MAJOR_SCALE_DEGREES:
+            mask[(key_i + deg) % 12] = 1
+        score = np.dot(avg_chroma, mask)
+        if score > best_score:
+            best_score, best_key = score, key_i
+    return best_key
+
+# ---------- 時間平滑（新增） ----------
+
+def smooth_labels(labels, window=5):
+    def complexity_rank(chord):
+        for suffix in ["add9", "aug", "dim", "maj7", "sus4", "sus2", "m7", "7", "m", ""]:
+            if chord.endswith(suffix) and chord != "N":
+                return len(suffix)
+        return 99 if chord != "N" else -1
+
+    smoothed = list(labels)
+    half = window // 2
+    for i in range(len(labels)):
+        start = max(0, i - half)
+        end = min(len(labels), i + half + 1)
+        window_labels = labels[start:end]
+        counts = {}
+        for l in window_labels:
+            counts[l] = counts.get(l, 0) + 1
+        max_count = max(counts.values())
+        candidates = [c for c, cnt in counts.items() if cnt == max_count]
+        smoothed[i] = min(candidates, key=complexity_rank)
+    return smoothed
+
+# ---------- 主辨識函式（修改） ----------
+
+def recognize_chords(audio_path, hop_length=2048, smooth_size=9, min_seg_sec=0.5,
+                      diatonic_bonus=0.08, smooth_window=5):
     y, sr = librosa.load(audio_path, sr=None, mono=True)
     chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop_length)
     chroma = median_filter(chroma, size=(1, smooth_size))
+
+    # 新增：先偵測整首歌的調性
+    key_root_i = detect_key(chroma)
+    diatonic_chords = set(get_diatonic_chords(key_root_i))
+    diatonic_bonus_vec = np.array([
+        diatonic_bonus if label in diatonic_chords else 0.0
+        for label in TEMPLATE_LABELS
+    ])
 
     frame_labels, frame_confidence = [], []
     for frame in chroma.T:
@@ -60,10 +126,14 @@ def recognize_chords(audio_path, hop_length=2048, smooth_size=9, min_seg_sec=0.5
             frame_confidence.append(0.0)
             continue
         frame_n = frame / norm
-        scores = TEMPLATE_MATRIX @ frame_n
+        # 新增：扣掉複雜度懲罰、加上調性加分
+        scores = TEMPLATE_MATRIX @ frame_n - TEMPLATE_PENALTIES + diatonic_bonus_vec
         best_idx = int(np.argmax(scores))
         frame_labels.append(TEMPLATE_LABELS[best_idx])
         frame_confidence.append(float(scores[best_idx]))
+
+    # 新增：時間平滑，過濾瞬間誤判
+    frame_labels = smooth_labels(frame_labels, window=smooth_window)
 
     times = librosa.frames_to_time(np.arange(len(frame_labels)), sr=sr, hop_length=hop_length)
 
