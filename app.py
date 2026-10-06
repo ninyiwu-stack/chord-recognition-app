@@ -1,5 +1,5 @@
 """
-和弦辨識網頁 App - Streamlit 版（含91吉他譜樣式排版）
+和弦辨識網頁 App - Streamlit 版（91吉他譜樣式 + 段落標示）
 """
 
 import streamlit as st
@@ -12,6 +12,7 @@ from datetime import datetime
 import os
 import tempfile
 import html
+import re
 
 # ========== 和弦辨識核心邏輯 ==========
 
@@ -97,18 +98,52 @@ def recognize_chords(audio_path, hop_length=2048, smooth_size=9, min_seg_sec=0.5
             filtered.append(seg)
     return filtered
 
-# ========== 歌詞對齊 + 91譜樣式渲染 ==========
+# ========== 歌詞解析：區分標籤行 / 歌詞行 ==========
 
-def align_chords_to_lyrics(chords, lyrics_lines, total_duration):
+def parse_lyrics_with_tags(lyrics_text):
+    """
+    [前奏]、[副歌] 這種整行只有標籤的 → type: tag
+    (男)歌詞內容 這種行首有角色標籤的 → type: lyric, 附帶 prefix_tag
+    空白行 → type: blank
+    """
+    lines = lyrics_text.split("\n")
+    parsed = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            parsed.append({"type": "blank", "content": ""})
+            continue
+
+        tag_only_match = re.fullmatch(r"[\[\(][^\]\)]*[\]\)]", stripped)
+        if tag_only_match:
+            parsed.append({"type": "tag", "content": stripped})
+            continue
+
+        prefix_match = re.match(r"^([\[\(][^\]\)]*[\]\)])(.*)", stripped)
+        if prefix_match:
+            tag_part = prefix_match.group(1)
+            lyric_part = prefix_match.group(2).strip()
+            parsed.append({"type": "lyric", "content": lyric_part, "prefix_tag": tag_part})
+            continue
+
+        parsed.append({"type": "lyric", "content": stripped, "prefix_tag": None})
+
+    return parsed
+
+# ========== 和弦對齊 + 91譜樣式渲染 ==========
+
+def align_chords_to_lyrics(chords, parsed_lines, total_duration):
     flat_chars = []
-    for li, line in enumerate(lyrics_lines):
-        for ci, ch in enumerate(line):
+    for li, item in enumerate(parsed_lines):
+        if item["type"] != "lyric":
+            continue
+        for ci, ch in enumerate(item["content"]):
             if ch != " ":
                 flat_chars.append((li, ci, ch))
 
     total_chars = len(flat_chars)
     if total_chars == 0:
-        return []
+        return {}
 
     chord_anchor_points = []
     for ch in chords:
@@ -118,29 +153,48 @@ def align_chords_to_lyrics(chords, lyrics_lines, total_duration):
         char_index = min(int(ratio * total_chars), total_chars - 1)
         chord_anchor_points.append((char_index, ch["chord"]))
 
-    line_chord_marks = [[None] * len(line) for line in lyrics_lines]
+    marks_by_line = {
+        li: [None] * len(item["content"])
+        for li, item in enumerate(parsed_lines) if item["type"] == "lyric"
+    }
+
     for char_index, chord_name in chord_anchor_points:
         li, ci, _ = flat_chars[char_index]
-        if line_chord_marks[li][ci] is None:
-            line_chord_marks[li][ci] = chord_name
+        if marks_by_line[li][ci] is None:
+            marks_by_line[li][ci] = chord_name
 
-    return line_chord_marks
+    return marks_by_line
 
 
-def render_html_lines(lyrics_lines, line_chord_marks):
-    html_blocks = []
-    for line, marks in zip(lyrics_lines, line_chord_marks):
-        if not line.strip():
-            html_blocks.append("<div style='height:12px;'></div>")
+def render_91_style_html(parsed_lines, marks_by_line):
+    blocks = []
+    for li, item in enumerate(parsed_lines):
+        if item["type"] == "blank":
+            blocks.append("<div style='height:14px;'></div>")
             continue
+
+        if item["type"] == "tag":
+            blocks.append(
+                f"<div style='color:#888; font-size:13px; margin:6px 0 2px 0;'>{html.escape(item['content'])}</div>"
+            )
+            continue
+
+        prefix = item.get("prefix_tag")
+        content = item["content"]
+        marks = marks_by_line.get(li, [None] * len(content))
+
+        row_html = ""
+        if prefix:
+            row_html += f"<span style='color:#888; font-size:13px; margin-right:4px;'>{html.escape(prefix)}</span>"
+
         chord_cells = ""
         lyric_cells = ""
-        for ch, mark in zip(line, marks):
-            chord_text = mark if mark else ""
+        for ch, mark in zip(content, marks):
             if ch == " ":
-                chord_cells += "<td style='width:10px;'></td>"
-                lyric_cells += "<td style='width:10px;'></td>"
+                chord_cells += "<td style='width:8px;'></td>"
+                lyric_cells += "<td style='width:8px;'></td>"
                 continue
+            chord_text = mark if mark else ""
             chord_cells += (
                 f"<td style='padding:0 2px; color:#1a73e8; font-weight:bold; "
                 f"font-size:13px; text-align:center; white-space:nowrap;'>{html.escape(chord_text)}</td>"
@@ -148,14 +202,15 @@ def render_html_lines(lyrics_lines, line_chord_marks):
             lyric_cells += (
                 f"<td style='padding:0 2px; text-align:center; font-size:16px;'>{html.escape(ch)}</td>"
             )
+
         table = (
-            "<table style='border-collapse:collapse; margin-bottom:2px;'>"
-            f"<tr>{chord_cells}</tr>"
-            f"<tr>{lyric_cells}</tr>"
+            "<table style='border-collapse:collapse; display:inline-table; vertical-align:middle;'>"
+            f"<tr>{chord_cells}</tr><tr>{lyric_cells}</tr>"
             "</table>"
         )
-        html_blocks.append(table)
-    return "".join(html_blocks)
+        blocks.append(f"<div style='margin-bottom:2px;'>{row_html}{table}</div>")
+
+    return "".join(blocks)
 
 # ========== 資料庫 ==========
 
@@ -203,7 +258,25 @@ st.set_page_config(page_title="自動和弦辨識", page_icon="🎸", layout="wi
 init_db()
 
 st.title("🎸 自動和弦辨識 - 91譜樣式")
-st.caption("上傳音檔 + 貼上歌詞，自動產生和弦對照歌詞譜")
+st.caption("上傳音檔 + 貼上歌詞，自動產生和弦對照歌詞譜（支援段落標示）")
+
+with st.expander("📖 歌詞格式說明（點我展開）"):
+    st.markdown("""
+    支援以下標記方式，讓排版更接近91吉他譜：
+
+    - `[前奏]`、`[副歌]`、`[間奏]` → 整行只放這種標籤，會顯示為獨立的段落提示
+    - `(男)`、`(女)`、`(合)` → 放在歌詞行最前面，會顯示為該行的角色標示
+    - 空白行 → 會變成段落間的留白
+
+    範例：
+    ```
+    [前奏]
+    (男)你還愛我嗎 你還愛我嗎 你怪我合不爭氣想回到你身旁
+
+    [副歌]
+    (合)也許這一切都是最好的安排 但我無法看著你難開
+    ```
+    """)
 
 with st.form("upload_form"):
     uploaded_file = st.file_uploader("選擇音檔", type=["mp3", "wav", "m4a", "flac"])
@@ -214,9 +287,9 @@ with st.form("upload_form"):
         artist = st.text_input("歌手", placeholder="例如：菲道爾")
     genre = st.selectbox("曲風", ["流行", "民謠", "搖滾", "抒情", "其他"])
     lyrics_text = st.text_area(
-        "貼上歌詞（一行一句，可留空）",
-        height=150,
-        placeholder="你還愛我嗎 你還愛我嗎 你怪我合不爭氣想回到你身旁\n沒想到只能走到這 看你濕了眼我到底算說什麼"
+        "貼上歌詞（可用 [標籤] 和 (角色) 格式，詳見上方說明）",
+        height=180,
+        placeholder="[前奏]\n(男)你還愛我嗎 你還愛我嗎 你怪我合不爭氣想回到你身旁\n\n[副歌]\n(合)也許這一切都是最好的安排"
     )
     user_email = st.text_input("Email（選填）", placeholder="your@email.com")
     submitted = st.form_submit_button("🔍 開始分析")
@@ -231,19 +304,21 @@ if submitted and uploaded_file is not None:
         try:
             segments = recognize_chords(tmp_path)
             duration = segments[-1]["end"] if segments else 0.0
-            lyrics_lines = [l for l in lyrics_text.split("\n")] if lyrics_text.strip() else []
+
+            parsed_lines = parse_lyrics_with_tags(lyrics_text) if lyrics_text.strip() else []
+            has_lyrics = len(parsed_lines) > 0
 
             save_record(song_title or "未命名", artist or "未知", genre,
-                        duration, segments, user_email or None, bool(lyrics_lines))
+                        duration, segments, user_email or None, has_lyrics)
 
             st.success(f"✅ 分析完成！共偵測到 {len(segments)} 個和弦段落")
 
-            if lyrics_lines:
+            if parsed_lines:
                 st.subheader("📜 和弦歌詞對照譜")
-                marks = align_chords_to_lyrics(segments, lyrics_lines, duration)
-                rendered_html = render_html_lines(lyrics_lines, marks)
+                marks_by_line = align_chords_to_lyrics(segments, parsed_lines, duration)
+                rendered_html = render_91_style_html(parsed_lines, marks_by_line)
                 st.markdown(
-                    f"<div style='line-height:1.8;'>{rendered_html}</div>",
+                    f"<div style='line-height:1.8; padding:16px; background:#fafafa; border-radius:8px;'>{rendered_html}</div>",
                     unsafe_allow_html=True
                 )
                 st.caption("⚠️ 和弦位置是依時間比例自動對齊，可能與實際彈奏點略有誤差")
