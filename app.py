@@ -1,13 +1,5 @@
 """
-和弦辨識網頁 App - Streamlit 版
---------------------------------
-安裝方式（只需這一行）:
-    pip install streamlit librosa scipy numpy soundfile
-
-啟動方式（只需這一行）:
-    streamlit run app.py
-
-執行後會自動開啟瀏覽器網頁，網址通常是 http://localhost:8501
+和弦辨識網頁 App - Streamlit 版（含91吉他譜樣式排版）
 """
 
 import streamlit as st
@@ -19,8 +11,9 @@ import json
 from datetime import datetime
 import os
 import tempfile
+import html
 
-# ========== 和弦辨識核心邏輯（已驗證過）==========
+# ========== 和弦辨識核心邏輯 ==========
 
 PITCHES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
@@ -53,7 +46,7 @@ TEMPLATES = build_templates()
 TEMPLATE_LABELS = list(TEMPLATES.keys())
 TEMPLATE_MATRIX = np.stack([TEMPLATES[l] for l in TEMPLATE_LABELS], axis=0)
 
-def recognize_chords(audio_path, hop_length=2048, smooth_size=9, min_seg_sec=0.3):
+def recognize_chords(audio_path, hop_length=2048, smooth_size=9, min_seg_sec=0.5):
     y, sr = librosa.load(audio_path, sr=None, mono=True)
     chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop_length)
     chroma = median_filter(chroma, size=(1, smooth_size))
@@ -104,7 +97,67 @@ def recognize_chords(audio_path, hop_length=2048, smooth_size=9, min_seg_sec=0.3
             filtered.append(seg)
     return filtered
 
-# ========== 資料庫（收集資料用）==========
+# ========== 歌詞對齊 + 91譜樣式渲染 ==========
+
+def align_chords_to_lyrics(chords, lyrics_lines, total_duration):
+    flat_chars = []
+    for li, line in enumerate(lyrics_lines):
+        for ci, ch in enumerate(line):
+            if ch != " ":
+                flat_chars.append((li, ci, ch))
+
+    total_chars = len(flat_chars)
+    if total_chars == 0:
+        return []
+
+    chord_anchor_points = []
+    for ch in chords:
+        if ch["chord"] == "N":
+            continue
+        ratio = ch["start"] / total_duration if total_duration > 0 else 0
+        char_index = min(int(ratio * total_chars), total_chars - 1)
+        chord_anchor_points.append((char_index, ch["chord"]))
+
+    line_chord_marks = [[None] * len(line) for line in lyrics_lines]
+    for char_index, chord_name in chord_anchor_points:
+        li, ci, _ = flat_chars[char_index]
+        if line_chord_marks[li][ci] is None:
+            line_chord_marks[li][ci] = chord_name
+
+    return line_chord_marks
+
+
+def render_html_lines(lyrics_lines, line_chord_marks):
+    html_blocks = []
+    for line, marks in zip(lyrics_lines, line_chord_marks):
+        if not line.strip():
+            html_blocks.append("<div style='height:12px;'></div>")
+            continue
+        chord_cells = ""
+        lyric_cells = ""
+        for ch, mark in zip(line, marks):
+            chord_text = mark if mark else ""
+            if ch == " ":
+                chord_cells += "<td style='width:10px;'></td>"
+                lyric_cells += "<td style='width:10px;'></td>"
+                continue
+            chord_cells += (
+                f"<td style='padding:0 2px; color:#1a73e8; font-weight:bold; "
+                f"font-size:13px; text-align:center; white-space:nowrap;'>{html.escape(chord_text)}</td>"
+            )
+            lyric_cells += (
+                f"<td style='padding:0 2px; text-align:center; font-size:16px;'>{html.escape(ch)}</td>"
+            )
+        table = (
+            "<table style='border-collapse:collapse; margin-bottom:2px;'>"
+            f"<tr>{chord_cells}</tr>"
+            f"<tr>{lyric_cells}</tr>"
+            "</table>"
+        )
+        html_blocks.append(table)
+    return "".join(html_blocks)
+
+# ========== 資料庫 ==========
 
 DB_PATH = "chord_database.db"
 
@@ -122,44 +175,50 @@ def init_db():
             chord_count INTEGER,
             chord_progression TEXT,
             avg_confidence REAL,
-            user_email TEXT
+            user_email TEXT,
+            has_lyrics BOOLEAN DEFAULT 0
         )
     """)
     conn.commit()
     conn.close()
 
-def save_record(song_title, artist, genre, duration_sec, chords, user_email):
+def save_record(song_title, artist, genre, duration_sec, chords, user_email, has_lyrics):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     avg_conf = sum(ch["confidence"] for ch in chords) / len(chords) if chords else 0
     c.execute("""
         INSERT INTO analysis_records
-        (created_at, song_title, artist, genre, duration_sec, chord_count, chord_progression, avg_confidence, user_email)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (created_at, song_title, artist, genre, duration_sec, chord_count, chord_progression, avg_confidence, user_email, has_lyrics)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         datetime.now().isoformat(), song_title, artist, genre, duration_sec,
-        len(chords), json.dumps(chords, ensure_ascii=False), avg_conf, user_email
+        len(chords), json.dumps(chords, ensure_ascii=False), avg_conf, user_email, has_lyrics
     ))
     conn.commit()
     conn.close()
 
 # ========== 網頁介面 ==========
 
-st.set_page_config(page_title="自動和弦辨識", page_icon="🎸")
+st.set_page_config(page_title="自動和弦辨識", page_icon="🎸", layout="wide")
 init_db()
 
-st.title("🎸 自動和弦辨識")
-st.caption("上傳音檔，自動分析和弦進行")
+st.title("🎸 自動和弦辨識 - 91譜樣式")
+st.caption("上傳音檔 + 貼上歌詞，自動產生和弦對照歌詞譜")
 
 with st.form("upload_form"):
     uploaded_file = st.file_uploader("選擇音檔", type=["mp3", "wav", "m4a", "flac"])
     col1, col2 = st.columns(2)
     with col1:
-        song_title = st.text_input("歌曲名稱", placeholder="例如：告白氣球")
+        song_title = st.text_input("歌曲名稱", placeholder="例如：往加納共和國離婚")
     with col2:
-        artist = st.text_input("歌手", placeholder="例如：周杰倫")
+        artist = st.text_input("歌手", placeholder="例如：菲道爾")
     genre = st.selectbox("曲風", ["流行", "民謠", "搖滾", "抒情", "其他"])
-    user_email = st.text_input("Email（選填，用於未來功能通知）", placeholder="your@email.com")
+    lyrics_text = st.text_area(
+        "貼上歌詞（一行一句，可留空）",
+        height=150,
+        placeholder="你還愛我嗎 你還愛我嗎 你怪我合不爭氣想回到你身旁\n沒想到只能走到這 看你濕了眼我到底算說什麼"
+    )
+    user_email = st.text_input("Email（選填）", placeholder="your@email.com")
     submitted = st.form_submit_button("🔍 開始分析")
 
 if submitted and uploaded_file is not None:
@@ -172,19 +231,32 @@ if submitted and uploaded_file is not None:
         try:
             segments = recognize_chords(tmp_path)
             duration = segments[-1]["end"] if segments else 0.0
+            lyrics_lines = [l for l in lyrics_text.split("\n")] if lyrics_text.strip() else []
 
-            save_record(song_title or "未命名", artist or "未知",
-                        genre, duration, segments, user_email or None)
+            save_record(song_title or "未命名", artist or "未知", genre,
+                        duration, segments, user_email or None, bool(lyrics_lines))
 
             st.success(f"✅ 分析完成！共偵測到 {len(segments)} 個和弦段落")
 
-            st.subheader("和弦進行結果")
-            for seg in segments:
-                conf_color = "🟢" if seg["confidence"] > 0.9 else ("🟡" if seg["confidence"] > 0.7 else "🔴")
-                st.write(f"{conf_color} **{seg['chord']}**　|　{seg['start']}s ~ {seg['end']}s　|　信心度 {seg['confidence']:.2f}")
+            if lyrics_lines:
+                st.subheader("📜 和弦歌詞對照譜")
+                marks = align_chords_to_lyrics(segments, lyrics_lines, duration)
+                rendered_html = render_html_lines(lyrics_lines, marks)
+                st.markdown(
+                    f"<div style='line-height:1.8;'>{rendered_html}</div>",
+                    unsafe_allow_html=True
+                )
+                st.caption("⚠️ 和弦位置是依時間比例自動對齊，可能與實際彈奏點略有誤差")
+            else:
+                st.info("💡 沒有貼歌詞時，只顯示和弦時間軸列表（貼上歌詞可以產生91譜樣式對照）")
 
-            chord_line = "  ".join([seg["chord"] for seg in segments])
-            st.subheader("簡易和弦譜")
+            with st.expander("查看詳細和弦時間軸"):
+                for seg in segments:
+                    conf_color = "🟢" if seg["confidence"] > 0.9 else ("🟡" if seg["confidence"] > 0.7 else "🔴")
+                    st.write(f"{conf_color} **{seg['chord']}** | {seg['start']}s ~ {seg['end']}s | 信心度 {seg['confidence']:.2f}")
+
+            chord_line = "  ".join([seg["chord"] for seg in segments if seg["chord"] != "N"])
+            st.subheader("簡易和弦序列")
             st.code(chord_line)
 
         except Exception as e:
