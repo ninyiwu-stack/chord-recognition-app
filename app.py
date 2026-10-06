@@ -199,9 +199,10 @@ def render_91_style_html(parsed_lines, marks_by_line):
                 f"<td style='padding:0 2px; color:#1a73e8; font-weight:bold; "
                 f"font-size:13px; text-align:center; white-space:nowrap;'>{html.escape(chord_text)}</td>"
             )
-            lyric_cells += (
-                f"<td style='padding:0 2px; text-align:center; font-size:16px;'>{html.escape(ch)}</td>"
+                    lyric_cells += (
+                f"<td style='padding:0 2px; text-align:center; font-size:16px; color:#1a1a1a;'>{html.escape(ch)}</td>"
             )
+
 
         table = (
             "<table style='border-collapse:collapse; display:inline-table; vertical-align:middle;'>"
