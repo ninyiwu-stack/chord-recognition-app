@@ -230,12 +230,25 @@ def init_db():
             chord_count INTEGER,
             chord_progression TEXT,
             avg_confidence REAL,
-            user_email TEXT,
-            has_lyrics BOOLEAN DEFAULT 0
+            user_email TEXT
         )
     """)
+
+    # 自動偵測並補上後來新增的欄位，避免舊資料庫缺欄位報錯
+    c.execute("PRAGMA table_info(analysis_records)")
+    existing_columns = [row[1] for row in c.fetchall()]
+
+    required_columns = {
+        "has_lyrics": "BOOLEAN DEFAULT 0"
+    }
+
+    for col_name, col_def in required_columns.items():
+        if col_name not in existing_columns:
+            c.execute(f"ALTER TABLE analysis_records ADD COLUMN {col_name} {col_def}")
+
     conn.commit()
     conn.close()
+
 
 def save_record(song_title, artist, genre, duration_sec, chords, user_email, has_lyrics):
     conn = sqlite3.connect(DB_PATH)
