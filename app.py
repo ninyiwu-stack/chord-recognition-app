@@ -195,14 +195,8 @@ def render_91_style_html(parsed_lines, marks_by_line):
                 lyric_cells += "<td style='width:8px;'></td>"
                 continue
             chord_text = mark if mark else ""
-            chord_cells += (
-                f"<td style='padding:0 2px; color:#1a73e8; font-weight:bold; "
-                f"font-size:13px; text-align:center; white-space:nowrap;'>{html.escape(chord_text)}</td>"
-            )
-                    lyric_cells += (
-                f"<td style='padding:0 2px; text-align:center; font-size:16px; color:#1a1a1a;'>{html.escape(ch)}</td>"
-            )
-
+            chord_cells += f"<td style='padding:0 2px; color:#1a73e8; font-weight:bold; font-size:13px; text-align:center; white-space:nowrap;'>{html.escape(chord_text)}</td>"
+            lyric_cells += f"<td style='padding:0 2px; text-align:center; font-size:16px; color:#1a1a1a;'>{html.escape(ch)}</td>"
 
         table = (
             "<table style='border-collapse:collapse; display:inline-table; vertical-align:middle;'>"
@@ -212,6 +206,7 @@ def render_91_style_html(parsed_lines, marks_by_line):
         blocks.append(f"<div style='margin-bottom:2px;'>{row_html}{table}</div>")
 
     return "".join(blocks)
+
 
 # ========== 資料庫 ==========
 
